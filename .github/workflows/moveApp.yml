@@ -28,11 +28,11 @@ jobs:
       - name: "Check jq version"
         run: jq --version
        
-      - name: "Convert ${{ github.head_ref }}.json to .env"
+      - name: "Convert deployment JSON to .env"
         uses: ricosandyca/convert-env-json@main
         with:
           type: json-to-env
-          input_path: "deployments/${{ github.head_ref }}.json"
+          input_path: "deployments/${{ github.head_ref || github.ref_name }}.json"
           output_path: ".env"
       
       - name: "Load .env"
@@ -143,6 +143,7 @@ jobs:
         run: if [ "${{ fromJson( env.AUTOMATION_RESPONSE ) }}" -ne 200 ]; then exit "${{ fromJson( env.AUTOMATION_RESPONSE ) }}"; fi
         
       - name: Comment PR
+        if: github.event_name == 'pull_request'
         uses: thollander/actions-comment-pull-request@v2.3.1
         with:
           message: |
