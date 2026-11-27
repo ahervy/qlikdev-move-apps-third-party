@@ -1,0 +1,43 @@
+name: Test return automation callback
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  callback:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call the return automation
+        env:
+          RETURN_URL: ${{ vars.RETURN_AUTOMATION }}
+          RETURN_TOKEN: ${{ secrets.RETURN_AUTOMATION_TOKEN }}
+          EXPECTED_APP_ID: 7c3325c1-ee8d-41a7-8aba-2deab4e695b5
+        run: |
+          if [[ -z "$RETURN_URL" || -z "$RETURN_TOKEN" ]]; then
+            echo "Check RETURN_AUTOMATION and RETURN_AUTOMATION_TOKEN in this fork."
+            exit 1
+          fi
+
+          body=$(mktemp)
+          trap 'rm -f "$body"' EXIT
+
+          status=$(curl --silent --show-error \
+            --output "$body" --write-out '%{http_code}' \
+            --header "X-Execution-Token: $RETURN_TOKEN" \
+            --data-urlencode 'id=doc-6125-callback-check' \
+            --data-urlencode 'name=qlik-dev-exec-dashboard' \
+            --data-urlencode 'sourceTenant=quw43rqzrbjor0s.eu.qlikcloud.com' \
+            --data-urlencode 'targetTenant=yiwhse8ctjk7c5q.eu.qlikcloud.com' \
+            --data-urlencode 'targetSpaceId=6ad767548a3a0108b90d5e8c' \
+            --data-urlencode 'sourceAppId=82978ac1-1035-42b4-9fb3-47f2f5814138' \
+            --data-urlencode "newAppId=$EXPECTED_APP_ID" \
+            "$RETURN_URL")
+
+          printf 'Callback HTTP %s\n' "$status"
+          [[ "$status" == 200 ]] || exit 1
+
+          jq -e --arg id "$EXPECTED_APP_ID" \
+            'any(.[]; .newAppId == $id)' "$body" > /dev/null
+          printf 'Return automation received newAppId %s\n' "$EXPECTED_APP_ID"
