@@ -5,7 +5,7 @@ name: Move app from source to target
 on:
   # On PR against main
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
   # Manual run
   workflow_dispatch:
@@ -15,37 +15,44 @@ jobs:
   moveApp:
     # Run on ubuntu-latest for additional curl features
     runs-on: ubuntu-latest
-    permissions: write-all 
+    permissions: write-all
     steps:
-    
       # Checks-out your repository under $GITHUB_WORKSPACE
       - name: "Checkout repo"
         uses: actions/checkout@v4
-        
+
       - name: "Check curl version"
         run: curl --version
-          
+
       - name: "Check jq version"
         run: jq --version
-       
+
       - name: "Convert ${{ github.head_ref }}.json to .env"
         uses: ricosandyca/convert-env-json@main
         with:
           type: json-to-env
           input_path: "deployments/${{ github.head_ref }}.json"
           output_path: ".env"
-      
+
       - name: "Load .env"
         uses: aarcangeli/load-dotenv@v1.0.0
 
       - name: "Retrieve OAuth token for source tenant"
+        env:
+          OAUTH_ID: ${{ vars.OAUTH_ID }}
+          OAUTH_SECRET: ${{ secrets.OAUTH_SECRET }}
         run: |
-          SOURCE_TOKEN=$(curl -L "https://${{ env.sourceTenant }}/oauth/token" \
-          -X POST \
-          -H "Accept: application/json" \
-          -H "Content-Type: application/json" \
-          -d '{"client_id":"${{ vars.OAUTH_ID }}", "client_secret":"${{ secrets.OAUTH_SECRET }}", "grant_type":"client_credentials"}')
-          echo "SOURCE_TOKEN=$SOURCE_TOKEN" >> $GITHUB_ENV
+          set -o pipefail
+          SOURCE_TOKEN=$(jq -nc --arg id "$OAUTH_ID" --arg secret "$OAUTH_SECRET" \
+            '{client_id: $id, client_secret: $secret, grant_type: "client_credentials"}' |
+            curl -fsS --location "https://$sourceTenant/oauth/token" \
+              -H 'Accept: application/json' \
+              -H 'Content-Type: application/json' \
+              --data-binary @- |
+            jq -c .)
+          access_token=$(jq -er '.access_token | strings | select(length > 0)' <<< "$SOURCE_TOKEN")
+          printf '::add-mask::%s\n' "$access_token"
+          printf 'SOURCE_TOKEN=%s\n' "$SOURCE_TOKEN" >> "$GITHUB_ENV"
 
       - name: "Run export command on source tenant"
         run: |
@@ -54,8 +61,8 @@ jobs:
           -H "Content-Type: application/octet-stream" \
           -H "Authorization: Bearer ${{ fromJson(env.SOURCE_TOKEN).access_token }}" \
           | grep -F "location:" | awk '{print $2}' | tr -d '[:space:]')
-          echo "SOURCE_LOCATION=$SOURCE_LOCATION" >> $GITHUB_ENV
-          
+          echo "SOURCE_LOCATION=$SOURCE_LOCATION" >> "$GITHUB_ENV"
+
       - name: "Download exported app from source tenant"
         run: |
           curl --output "export.qvf" \
@@ -63,64 +70,95 @@ jobs:
           -H "Authorization: Bearer ${{ fromJson(env.SOURCE_TOKEN).access_token }}" \
           -H "Content-Type: application/octet-stream"
           ls -l
-          
+
       - name: "Retrieve OAuth token for target tenant"
+        env:
+          OAUTH_ID: ${{ vars.OAUTH_ID }}
+          OAUTH_SECRET: ${{ secrets.OAUTH_SECRET }}
         run: |
-          TARGET_TOKEN=$(curl -L "https://${{ env.targetTenant }}/oauth/token" \
-          -X POST \
-          -H "Accept: application/json" \
-          -H "Content-Type: application/json" \
-          -d '{"client_id":"${{ vars.OAUTH_ID }}", "client_secret":"${{ secrets.OAUTH_SECRET }}", "grant_type":"client_credentials"}')
-          echo "TARGET_TOKEN=$TARGET_TOKEN" >> $GITHUB_ENV
-          
+          set -o pipefail
+          TARGET_TOKEN=$(jq -nc --arg id "$OAUTH_ID" --arg secret "$OAUTH_SECRET" \
+            '{client_id: $id, client_secret: $secret, grant_type: "client_credentials"}' |
+            curl -fsS --location "https://$targetTenant/oauth/token" \
+              -H 'Accept: application/json' \
+              -H 'Content-Type: application/json' \
+              --data-binary @- |
+            jq -c .)
+          access_token=$(jq -er '.access_token | strings | select(length > 0)' <<< "$TARGET_TOKEN")
+          printf '::add-mask::%s\n' "$access_token"
+          printf 'TARGET_TOKEN=%s\n' "$TARGET_TOKEN" >> "$GITHUB_ENV"
+
       - name: "Upload app to target tenant"
+        env:
+          TARGET_ACCESS_TOKEN: ${{ fromJson(env.TARGET_TOKEN).access_token }}
         run: |
-          TARGET_LOCATION=$(curl -L "https://${{ env.targetTenant }}/api/v1/temp-contents?filename=export.qvf" -v \
-          -X POST \
-          -H "Authorization: Bearer ${{ fromJson(env.TARGET_TOKEN).access_token }}" \
-          -H "Content-type: application/octet-stream" \
-          -H "Transfer-Encoding: chunked" \
-          -T "export.qvf" 2>&1 \
-          | grep -F "< location:" | awk '{print $3}' | tr -d '[:space:]' | awk -F / '{print $NF}')
-          echo "TARGET_LOCATION=$TARGET_LOCATION" >> $GITHUB_ENV
-          echo $TARGET_LOCATION
-          
+          headers=$(mktemp)
+          trap 'rm -f "$headers"' EXIT
+
+          curl -fsS --location \
+            -X POST \
+            -H "Authorization: Bearer $TARGET_ACCESS_TOKEN" \
+            -H 'Content-Type: application/octet-stream' \
+            -T export.qvf \
+            -D "$headers" \
+            -o /dev/null \
+            "https://$targetTenant/api/v1/temp-contents?filename=export.qvf"
+
+          location=$(awk 'tolower($1) == "location:" {
+            sub(/\r$/, "", $2)
+            location = $2
+          } END { print location }' "$headers")
+          TARGET_LOCATION="${location##*/}"
+          if [[ -z "$TARGET_LOCATION" ]]; then
+            echo 'Temporary upload returned no file ID' >&2
+            exit 1
+          fi
+          printf 'TARGET_LOCATION=%s\n' "$TARGET_LOCATION" >> "$GITHUB_ENV"
+
       - name: "Import app to shared space"
         env:
           APP_NAME: ${{ env.name }}
+          TARGET_ACCESS_TOKEN: ${{ fromJson(env.TARGET_TOKEN).access_token }}
         run: |
-          IMPORTED_APP=$(curl "https://${{ env.targetTenant }}/api/v1/apps/import" \
-          -X POST -G \
-          --data-urlencode 'fileId=${{ env.TARGET_LOCATION }}' \
-          --data-urlencode "name=$APP_NAME" \
-          --data-urlencode 'spaceId=${{ env.targetSpaceId }}' \
-          -H "Authorization: Bearer ${{ fromJson(env.TARGET_TOKEN).access_token }}" \
-          -H "Content-type: application/json" \
-          -H "Accept: application/json"  | jq -r '.attributes.id')
-          echo "IMPORTED_APP=$IMPORTED_APP" >> $GITHUB_ENV
-          echo $IMPORTED_APP
+          set -o pipefail
+          IMPORTED_APP=$(curl -fsS "https://$targetTenant/api/v1/apps/import" \
+            -X POST -G \
+            --data-urlencode "fileId=$TARGET_LOCATION" \
+            --data-urlencode "name=$APP_NAME" \
+            --data-urlencode "spaceId=$targetSpaceId" \
+            -H "Authorization: Bearer $TARGET_ACCESS_TOKEN" \
+            -H 'Accept: application/json' |
+            jq -er '.attributes.id | strings | select(length > 0)')
+          printf 'IMPORTED_APP=%s\n' "$IMPORTED_APP" >> "$GITHUB_ENV"
+          printf 'Imported app ID: %s\n' "$IMPORTED_APP"
 
       - name: "Send callback to automations"
+        env:
+          RETURN_URL: ${{ vars.RETURN_AUTOMATION }}
+          RETURN_TOKEN: ${{ secrets.RETURN_AUTOMATION_TOKEN }}
         run: |
-          AUTOMATION_RESPONSE=$(curl '${{ vars.RETURN_AUTOMATION }}' \
-          -X POST \
-          -s -o /dev/null -w "%{http_code}" \
-          -H 'X-Execution-Token: ${{ secrets.RETURN_AUTOMATION_TOKEN }}' \
-          --data-urlencode 'id=${{ env.id }}' \
-          --data-urlencode 'name=${{ env.name }}' \
-          --data-urlencode 'sourcetenant=${{ env.sourceTenant }}' \
-          --data-urlencode 'targettenant=${{ env.targetTenant }}' \
-          --data-urlencode 'targetspaceid=${{ env.targetSpaceId }}' \
-          --data-urlencode 'sourceappid=${{ env.sourceAppId }}' \
-          --data-urlencode 'newappid=${{ env.IMPORTED_APP }}')
-          echo "AUTOMATION_RESPONSE=$AUTOMATION_RESPONSE" >> $GITHUB_ENV
-      
+          AUTOMATION_RESPONSE=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -X POST \
+            -H "X-Execution-Token: $RETURN_TOKEN" \
+            --data-urlencode "id=$id" \
+            --data-urlencode "name=$name" \
+            --data-urlencode "sourceTenant=$sourceTenant" \
+            --data-urlencode "targetTenant=$targetTenant" \
+            --data-urlencode "targetSpaceId=$targetSpaceId" \
+            --data-urlencode "sourceAppId=$sourceAppId" \
+            --data-urlencode "newAppId=$IMPORTED_APP" \
+            "$RETURN_URL")
+          printf 'AUTOMATION_RESPONSE=%s\n' "$AUTOMATION_RESPONSE" >> "$GITHUB_ENV"
+
       - name: "Verify automation response code"
-        run: if [ "${{ fromJson( env.AUTOMATION_RESPONSE ) }}" -ne 200 ]; then exit "${{ fromJson( env.AUTOMATION_RESPONSE ) }}"; fi
-        
+        run: |
+          if [[ "$AUTOMATION_RESPONSE" != 200 ]]; then
+            printf 'Return automation returned HTTP %s\n' "$AUTOMATION_RESPONSE" >&2
+            exit 1
+          fi
+
       - name: Comment PR
         uses: thollander/actions-comment-pull-request@v2.3.1
         with:
           message: |
             Content deployed successfully (${{ env.AUTOMATION_RESPONSE }} response) to [${{ env.targetTenant }}](https://${{ env.targetTenant }}/sense/app/${{ env.IMPORTED_APP }}).
-    
