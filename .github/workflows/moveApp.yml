@@ -45,6 +45,8 @@ jobs:
           -H "Accept: application/json" \
           -H "Content-Type: application/json" \
           -d '{"client_id":"${{ vars.OAUTH_ID }}", "client_secret":"${{ secrets.OAUTH_SECRET }}", "grant_type":"client_credentials"}')
+          access_token=$(jq -er '.access_token | strings | select(length > 0)' <<< "$SOURCE_TOKEN")
+          printf '::add-mask::%s\n' "$access_token"
           echo "SOURCE_TOKEN=$SOURCE_TOKEN" >> $GITHUB_ENV
 
       - name: "Run export command on source tenant"
@@ -71,33 +73,56 @@ jobs:
           -H "Accept: application/json" \
           -H "Content-Type: application/json" \
           -d '{"client_id":"${{ vars.OAUTH_ID }}", "client_secret":"${{ secrets.OAUTH_SECRET }}", "grant_type":"client_credentials"}')
+          access_token=$(jq -er '.access_token | strings | select(length > 0)' <<< "$TARGET_TOKEN")
+          printf '::add-mask::%s\n' "$access_token"
           echo "TARGET_TOKEN=$TARGET_TOKEN" >> $GITHUB_ENV
           
       - name: "Upload app to target tenant"
+        env:
+          TARGET_ACCESS_TOKEN: ${{ fromJson(env.TARGET_TOKEN).access_token }}
         run: |
-          TARGET_LOCATION=$(curl -L "https://${{ env.targetTenant }}/api/v1/temp-contents?filename=export.qvf" -v \
-          -X POST \
-          -H "Authorization: Bearer ${{ fromJson(env.TARGET_TOKEN).access_token }}" \
-          -H "Content-type: application/octet-stream" \
-          -H "Transfer-Encoding: chunked" \
-          -T "export.qvf" 2>&1 \
-          | grep -F "< location:" | awk '{print $3}' | tr -d '[:space:]' | awk -F / '{print $NF}')
-          echo "TARGET_LOCATION=$TARGET_LOCATION" >> $GITHUB_ENV
-          echo $TARGET_LOCATION
-          
+          headers=$(mktemp)
+          trap 'rm -f "$headers"' EXIT
+
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $TARGET_ACCESS_TOKEN" \
+            --header "Content-Type: application/octet-stream" \
+            --upload-file export.qvf \
+            --dump-header "$headers" \
+            --output /dev/null \
+            "https://${{ env.targetTenant }}/api/v1/temp-contents?filename=export.qvf"
+
+          location=$(awk 'tolower($1) == "location:" {
+            sub(/\r$/, "", $2)
+            print $2
+          }' "$headers" | tail -n 1)
+
+          file_id="${location##*/}"
+          if [[ -z "$file_id" ]]; then
+            echo "Temporary upload returned no file ID" >&2
+            exit 1
+          fi
+          printf 'TARGET_LOCATION=%s\n' "$file_id" >> "$GITHUB_ENV"
+
       - name: "Import app to shared space"
+        env:
+          APP_NAME: ${{ env.name }}
+          TARGET_ACCESS_TOKEN: ${{ fromJson(env.TARGET_TOKEN).access_token }}
         run: |
-          echo "APP_NAME=$(${{ env.name }} | sed 's/ /%20/g' )" >> $GITHUB_ENV
-          IMPORTED_APP=$(curl "https://${{ env.targetTenant }}/api/v1/apps/import" \
-          -X POST -G \
-          --data-urlencode 'fileId=${{ env.TARGET_LOCATION }}' \
-          --data-urlencode 'name=${{ env.APP_NAME }}' \
-          --data-urlencode 'spaceId=${{ env.targetSpaceId }}' \
-          -H "Authorization: Bearer ${{ fromJson(env.TARGET_TOKEN).access_token }}" \
-          -H "Content-type: application/json" \
-          -H "Accept: application/json"  | jq -r '.attributes.id')
-          echo "IMPORTED_APP=$IMPORTED_APP" >> $GITHUB_ENV
-          echo $IMPORTED_APP
+          set -o pipefail
+
+          imported_app=$(curl --fail-with-body --silent --show-error \
+            --request POST --get \
+            --data-urlencode "fileId=$TARGET_LOCATION" \
+            --data-urlencode "name=$APP_NAME" \
+            --data-urlencode "spaceId=${{ env.targetSpaceId }}" \
+            --header "Authorization: Bearer $TARGET_ACCESS_TOKEN" \
+            --header "Accept: application/json" \
+            "https://${{ env.targetTenant }}/api/v1/apps/import" |
+            jq -er '.attributes.id | strings | select(length > 0)')
+
+          printf 'IMPORTED_APP=%s\n' "$imported_app" >> "$GITHUB_ENV"
 
       - name: "Send callback to automations"
         run: |
@@ -121,17 +146,4 @@ jobs:
         uses: thollander/actions-comment-pull-request@v2.3.1
         with:
           message: |
-            Content deployed successfully (${{ env.AUTOMATION_RESPONSE }} response) to [${{ env.targetTenant }}](https://${{ env.targetTenant }}/sense/app/${{ env.IMPORTED_APP }}).
-      
-      - id: automerge
-        name: Merge the PR
-        uses: "pascalgn/automerge-action@v0.15.6"
-        env:
-          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
-          MERGE_LABELS: "!x"
-          
-      - name: Confirm PR merged
-        if: steps.automerge.outputs.mergeResult == 'merged'
-        run: |
-          echo "Pull request ${{ steps.automerge.outputs.pullRequestNumber }} merged."
-    
+            Content deployed successfully (${{ env.AUTOMATION_RESPONSE }} response) to [${{ env.targetTenant }}](https://${{ env.targetTenant }}/sense/app/${{ env.IMPORTED_APP }}).    
