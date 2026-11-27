@@ -86,12 +86,13 @@ jobs:
           echo $TARGET_LOCATION
           
       - name: "Import app to shared space"
+        env:
+          APP_NAME: ${{ env.name }}
         run: |
-          echo "APP_NAME=$(${{ env.name }} | sed 's/ /%20/g' )" >> $GITHUB_ENV
           IMPORTED_APP=$(curl "https://${{ env.targetTenant }}/api/v1/apps/import" \
           -X POST -G \
           --data-urlencode 'fileId=${{ env.TARGET_LOCATION }}' \
-          --data-urlencode 'name=${{ env.APP_NAME }}' \
+          --data-urlencode "name=$APP_NAME" \
           --data-urlencode 'spaceId=${{ env.targetSpaceId }}' \
           -H "Authorization: Bearer ${{ fromJson(env.TARGET_TOKEN).access_token }}" \
           -H "Content-type: application/json" \
@@ -122,16 +123,4 @@ jobs:
         with:
           message: |
             Content deployed successfully (${{ env.AUTOMATION_RESPONSE }} response) to [${{ env.targetTenant }}](https://${{ env.targetTenant }}/sense/app/${{ env.IMPORTED_APP }}).
-      
-      - id: automerge
-        name: Merge the PR
-        uses: "pascalgn/automerge-action@v0.15.6"
-        env:
-          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
-          MERGE_LABELS: "!x"
-          
-      - name: Confirm PR merged
-        if: steps.automerge.outputs.mergeResult == 'merged'
-        run: |
-          echo "Pull request ${{ steps.automerge.outputs.pullRequestNumber }} merged."
     
