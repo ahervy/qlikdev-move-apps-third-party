@@ -1,0 +1,8 @@
+{
+    "id":"6d8182eb-80c2-455f-a02a-1b60f4c8ae64-pltelhsx",
+    "name":"qlik-dev-exec-dashboard",
+    "sourceTenant":"quw43rqzrbjor0s.eu.qlikcloud.com",
+    "targetTenant":"yiwhse8ctjk7c5q.eu.qlikcloud.com",
+    "targetSpaceId":"6ad767548a3a0108b90d5e8c",
+    "sourceAppId":"82978ac1-1035-42b4-9fb3-47f2f5814138"
+}
